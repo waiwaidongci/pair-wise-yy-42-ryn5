@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from .allocation import (ALLOCATE_ROLES, RELEASE_ROLES, ensure_allocatable,
+                         normalize_resource)
 from .domain import ensure_role, normalize_severity, require_number, require_text
+from .offline import ensure_mergeable, normalize_batch, summarize_outcomes
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
@@ -55,6 +58,60 @@ class Service:
         })
         return record
 
+    def merge_offline_records(self, item_id: int, payload: Dict[str, Any],
+                              actor: str, role: str) -> Dict[str, Any]:
+        """离线补录合并：逐条判定受理/归档/重放，按最新观测刷新现值。"""
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        entries = normalize_batch(payload)
+        item = self.repository.get_item(item_id)
+        ensure_mergeable(item["status"])
+        results = []
+        for entry in entries:
+            record, outcome, first_outcome = self.repository.merge_offline_record(
+                item_id, entry, actor)
+            self.repository.append_audit("offline_merge", ENTITY, item_id, actor, {
+                "record_id": record["id"], "record_no": entry["record_no"],
+                "segment": entry["segment"], "observed_at": entry["observed_at"],
+                "outcome": outcome,
+            })
+            results.append({
+                "record_no": entry["record_no"], "outcome": outcome,
+                "first_outcome": first_outcome, "record": record,
+            })
+        return {
+            "item": self.enrich(self.repository.get_item(item_id)),
+            "results": results,
+            "summary": summarize_outcomes(results),
+        }
+
+    def assign_resource(self, item_id: int, payload: Dict[str, Any], actor: str,
+                        role: str) -> Dict[str, Any]:
+        ensure_role(role, ALLOCATE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        resource = normalize_resource(payload.get("resource"))
+        item = self.repository.get_item(item_id)
+        ensure_allocatable(item["status"])
+        allocation = self.repository.assign_resource(item_id, resource, actor)
+        self.repository.append_audit("allocate", ENTITY, item_id, actor, {
+            "allocation_id": allocation["id"], "resource": resource,
+        })
+        return allocation
+
+    def release_resource(self, item_id: int, allocation_id: int, actor: str,
+                         role: str) -> Dict[str, Any]:
+        ensure_role(role, RELEASE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        allocation = self.repository.release_resource(item_id, allocation_id, actor)
+        self.repository.append_audit("release", ENTITY, item_id, actor, {
+            "allocation_id": allocation["id"], "resource": allocation["resource"],
+        })
+        return allocation
+
+    def list_allocations(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_allocations(item_id)
+
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:
         actor = require_text(actor, "actor", 100)
@@ -91,11 +148,12 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        open_records = self.repository.open_record_count(item["id"])
         result = dict(item)
+        result["open_records"] = open_records
         result["priority"] = priority_score(
-            item["severity"], item["quantity"], item["threshold"])
+            item["severity"], item["quantity"], item["threshold"], open_records)
         result["deadline_hours"] = response_deadline_hours(
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(

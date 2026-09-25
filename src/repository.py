@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
+from .offline import APPLIED, ARCHIVED, REPLAYED, decide_outcome
 from .rules import ID_PREFIX, STATES
 
 
@@ -36,6 +37,7 @@ class Repository:
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
                     version INTEGER NOT NULL DEFAULT 1,
                     external_ref TEXT,
+                    last_observed_at TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -50,10 +52,26 @@ class Repository:
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
                     external_ref TEXT,
+                    segment TEXT,
+                    observed_at TEXT,
+                    risk_summary TEXT,
+                    applied INTEGER NOT NULL DEFAULT 1,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS allocations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    resource TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','released')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    released_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_allocations_active_resource
+                    ON allocations(resource) WHERE status='active';
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +84,28 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """老库补列：离线合并与资源分配引入的新字段。"""
+        record_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(records)")
+        }
+        record_additions = {
+            "segment": "ALTER TABLE records ADD COLUMN segment TEXT",
+            "observed_at": "ALTER TABLE records ADD COLUMN observed_at TEXT",
+            "risk_summary": "ALTER TABLE records ADD COLUMN risk_summary TEXT",
+            "applied": "ALTER TABLE records ADD COLUMN applied INTEGER NOT NULL DEFAULT 1",
+        }
+        item_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(items)")
+        }
+        with self.conn:
+            for column, sql in record_additions.items():
+                if column not in record_columns:
+                    self.conn.execute(sql)
+            if "last_observed_at" not in item_columns:
+                self.conn.execute("ALTER TABLE items ADD COLUMN last_observed_at TEXT")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -124,15 +164,19 @@ class Repository:
         return self.get_item(item_id)
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
-                   external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+                   external_ref: Optional[str], actor: str,
+                   segment: Optional[str] = None, observed_at: Optional[str] = None,
+                   risk_summary: Optional[str] = None, applied: int = 1) -> Dict[str, Any]:
         now = utc_now()
         self.get_item(item_id)
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
-                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
+                       segment, observed_at, risk_summary, applied, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, kind, detail, status, external_ref, segment,
+                     observed_at, risk_summary, applied, actor, now),
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -140,6 +184,48 @@ class Repository:
         with self._lock:
             row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
         return dict(row)
+
+    def merge_offline_record(self, item_id: int, entry: Dict[str, Any],
+                             actor: str) -> tuple:
+        """单事务完成补录：同编号重放返回首次受理结果，旧观测只归档不改现值。
+
+        返回 (record, outcome, first_outcome)。
+        """
+        now = utc_now()
+        with self._lock, self.conn:
+            item_row = self.conn.execute(
+                "SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if item_row is None:
+                raise NotFoundError("项目不存在")
+            existing = self.conn.execute(
+                "SELECT * FROM records WHERE item_id=? AND external_ref=?",
+                (item_id, entry["record_no"])).fetchone()
+            if existing is not None:
+                record = dict(existing)
+                first = APPLIED if record["applied"] else ARCHIVED
+                return record, REPLAYED, first
+            outcome = decide_outcome(item_row["last_observed_at"], entry["observed_at"])
+            applied = 1 if outcome == APPLIED else 0
+            cur = self.conn.execute(
+                """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                   segment, observed_at, risk_summary, applied, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, entry["kind"], entry["risk_summary"], entry["status"],
+                 entry["record_no"], entry["segment"], entry["observed_at"],
+                 entry["risk_summary"], applied, actor, now),
+            )
+            record_id = int(cur.lastrowid)
+            if applied:
+                self.conn.execute(
+                    """UPDATE items SET severity=COALESCE(?,severity),
+                       quantity=COALESCE(?,quantity), last_observed_at=?,
+                       version=version+1, updated_at=? WHERE id=?""",
+                    (entry["severity"], entry["quantity"], entry["observed_at"],
+                     now, item_id),
+                )
+            record = dict(self.conn.execute(
+                "SELECT * FROM records WHERE id=?", (record_id,)).fetchone())
+        return record, outcome, outcome
 
     def list_records(self, item_id: int) -> List[Dict[str, Any]]:
         self.get_item(item_id)
@@ -156,6 +242,51 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def assign_resource(self, item_id: int, resource: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO allocations(item_id, resource, status, created_by, created_at)
+                       VALUES(?,?,?,?,?)""",
+                    (item_id, resource, "active", actor, now),
+                )
+                allocation_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("同一资源不能同时出现在多个活动任务中") from exc
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+        return dict(row)
+
+    def release_resource(self, item_id: int, allocation_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE allocations SET status='released', released_at=?
+                   WHERE id=? AND item_id=? AND status='active'""",
+                (now, allocation_id, item_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM allocations WHERE id=? AND item_id=?",
+                    (allocation_id, item_id)).fetchone()
+                if exists is None:
+                    raise NotFoundError("分配不存在")
+                raise ConflictError("分配已释放")
+            row = self.conn.execute(
+                "SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
+        return dict(row)
+
+    def list_allocations(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM allocations WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

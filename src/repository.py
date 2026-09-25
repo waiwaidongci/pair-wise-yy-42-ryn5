@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
+from .offline_merge import plan_merge
 from .rules import ID_PREFIX, STATES
 
 
@@ -36,6 +37,7 @@ class Repository:
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
                     version INTEGER NOT NULL DEFAULT 1,
                     external_ref TEXT,
+                    last_observed_at TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -50,6 +52,10 @@ class Repository:
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
                     external_ref TEXT,
+                    segment TEXT,
+                    observed_at TEXT,
+                    risk_summary TEXT,
+                    merge_outcome TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
@@ -66,6 +72,23 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """为既有数据库补齐离线合并所需列（新库已由建表语句覆盖）。"""
+        additions = (
+            ("items", "last_observed_at", "last_observed_at TEXT"),
+            ("records", "segment", "segment TEXT"),
+            ("records", "observed_at", "observed_at TEXT"),
+            ("records", "risk_summary", "risk_summary TEXT"),
+            ("records", "merge_outcome", "merge_outcome TEXT"),
+        )
+        with self._lock, self.conn:
+            for table, column, ddl in additions:
+                columns = {row["name"] for row in
+                           self.conn.execute(f"PRAGMA table_info({table})")}
+                if column not in columns:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +179,52 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def merge_offline_records(self, item_id: int, observations: List[Dict[str, Any]],
+                              actor: str) -> tuple:
+        """在同一事务内完成离线补录合并：重放判重、乱序归档、现值推进。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute("SELECT * FROM items WHERE id=?",
+                                    (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            item = dict(row)
+            refs = [obs["ref"] for obs in observations]
+            placeholders = ",".join("?" for _ in refs)
+            existing = [dict(r) for r in self.conn.execute(
+                f"SELECT * FROM records WHERE item_id=? AND external_ref IN ({placeholders})",
+                (item_id, *refs),
+            ).fetchall()]
+            results, state = plan_merge(item, observations, existing)
+            inserted: Dict[str, int] = {}
+            for result in results:
+                if result["replayed"]:
+                    continue
+                obs = result["record"]
+                cur = self.conn.execute(
+                    """INSERT INTO records(item_id, kind, detail, status, external_ref,
+                       segment, observed_at, risk_summary, merge_outcome,
+                       created_by, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (item_id, obs["kind"], obs["risk_summary"], obs["status"],
+                     obs["ref"], obs["segment"], obs["observed_at"],
+                     obs["risk_summary"], result["outcome"], actor, now),
+                )
+                result["record_id"] = int(cur.lastrowid)
+                inserted[result["ref"]] = result["record_id"]
+            for result in results:
+                if result["record_id"] is None and result["ref"] in inserted:
+                    result["record_id"] = inserted[result["ref"]]
+            if (state["severity"] != item["severity"]
+                    or state["quantity"] != item["quantity"]
+                    or state["last_observed_at"] != item.get("last_observed_at")):
+                self.conn.execute(
+                    """UPDATE items SET severity=?, quantity=?, last_observed_at=?,
+                       version=version+1, updated_at=? WHERE id=?""",
+                    (state["severity"], state["quantity"],
+                     state["last_observed_at"], now, item_id),
+                )
+        return results, self.get_item(item_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

@@ -14,6 +14,8 @@ def response_deadline_hours(severity,quantity=0.0,threshold=1.0):
     return max(1,int(DEADLINE_HOURS[severity]/max(1.0,ratio)))
 def escalation_required(severity,quantity=0.0,threshold=1.0):
     return severity==SEVERITIES[-1] or (threshold>0 and quantity>=threshold)
+def recalculate_response(severity,quantity=0.0,threshold=1.0,open_records=0):
+    return {"priority":priority_score(severity,quantity,threshold,open_records),"deadline_hours":response_deadline_hours(severity,quantity,threshold),"escalation_required":escalation_required(severity,quantity,threshold)}
 def can_transition(current,target): return target in TRANSITIONS.get(current,[])
 def validate_transition(current,target):
     if current not in STATES or target not in STATES: raise ValidationError("未知状态")

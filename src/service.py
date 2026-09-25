@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .domain import ensure_role, normalize_severity, require_number, require_text
+from .offline_merge import validate_batch
 from .repository import Repository
 from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
                     VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+                    priority_score, recalculate_response, role_for_transition,
                     validate_transition)
 
 
@@ -55,6 +56,38 @@ class Service:
         })
         return record
 
+    def merge_offline_records(self, item_id: int, payload: Dict[str, Any],
+                              actor: str, role: str) -> Dict[str, Any]:
+        """离线补录合并：同编号重放返回首次受理结果，旧观测只归档不改现值。"""
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        observations = validate_batch(payload)
+        results, item = self.repository.merge_offline_records(
+            item_id, observations, actor)
+        open_records = self.repository.open_record_count(item_id)
+        recalc = recalculate_response(item["severity"], item["quantity"],
+                                      item["threshold"], open_records)
+        summary = {
+            "applied": sum(1 for r in results if r["outcome"] == "applied"
+                           and not r["replayed"]),
+            "archived": sum(1 for r in results if r["outcome"] == "archived"
+                            and not r["replayed"]),
+            "replayed": sum(1 for r in results if r["replayed"]),
+        }
+        outcome_view = [{
+            "ref": r["ref"], "record_id": r["record_id"], "outcome": r["outcome"],
+            "replayed": r["replayed"], "segment": r.get("segment"),
+            "observed_at": r.get("observed_at"),
+        } for r in results]
+        self.repository.append_audit("offline_merge", ENTITY, item_id, actor, {
+            "results": outcome_view, "summary": summary,
+            "last_observed_at": item.get("last_observed_at"),
+            "priority": recalc["priority"],
+            "deadline_hours": recalc["deadline_hours"],
+        })
+        return {"item": self.enrich(item), "results": outcome_view,
+                "summary": summary}
+
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:
         actor = require_text(actor, "actor", 100)
@@ -91,13 +124,10 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
-        result["priority"] = priority_score(
-            item["severity"], item["quantity"], item["threshold"])
-        result["deadline_hours"] = response_deadline_hours(
-            item["severity"], item["quantity"], item["threshold"])
-        result["escalation_required"] = escalation_required(
-            item["severity"], item["quantity"], item["threshold"])
+        open_records = self.repository.open_record_count(item["id"])
+        result.update(recalculate_response(
+            item["severity"], item["quantity"], item["threshold"], open_records))
+        result["open_records"] = open_records
         return result
